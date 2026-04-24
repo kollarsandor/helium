@@ -1997,50 +1997,90 @@ fn writeAgentTools(writer: anytype) !void {
 }
 
 fn callOpenAIStreaming(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, body: []const u8, callback: anytype, ctx: anytype) !void {
-    var client = std.http.Client{ .allocator = allocator };
-    defer client.deinit();
-
     const url_str = try std.fmt.allocPrint(allocator, "{s}/chat/completions", .{base_url});
     defer allocator.free(url_str);
 
-    const uri = try std.Uri.parse(url_str);
-
-    const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
+    const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
     defer allocator.free(auth_header);
 
-    var server_header_buf: [16384]u8 = undefined;
-    var req = try client.open(.POST, uri, .{
-        .server_header_buffer = &server_header_buf,
-        .extra_headers = &[_]std.http.Header{
-            .{ .name = "Authorization", .value = auth_header },
-            .{ .name = "Content-Type", .value = "application/json" },
-            .{ .name = "Accept", .value = "text/event-stream" },
-        },
-    });
-    defer req.deinit();
+    var child = std.process.Child.init(&[_][]const u8{
+        "curl",
+        "-sS",
+        "-N",
+        "--no-buffer",
+        "--fail-with-body",
+        "--max-time", "600",
+        "-X", "POST",
+        url_str,
+        "-H", auth_header,
+        "-H", "Content-Type: application/json",
+        "-H", "Accept: text/event-stream",
+        "--data-binary", "@-",
+    }, allocator);
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
 
-    req.transfer_encoding = .{ .content_length = body.len };
-    try req.send();
-    try req.writer().writeAll(body);
-    try req.finish();
-    try req.wait();
+    try child.spawn();
 
-    var reader = req.reader();
+    if (child.stdin) |stdin| {
+        stdin.writeAll(body) catch {};
+        stdin.close();
+        child.stdin = null;
+    }
+
+    var stderr_buf = std.ArrayList(u8).init(allocator);
+    defer stderr_buf.deinit();
+
     var line_buf = std.ArrayList(u8).init(allocator);
     defer line_buf.deinit();
 
-    while (true) {
-        const byte = reader.readByte() catch break;
-        if (byte == '\n') {
-            const line = std.mem.trimRight(u8, line_buf.items, "\r");
-            if (line.len > 0) {
-                try callback(allocator, line, ctx);
+    var read_err: ?anyerror = null;
+    if (child.stdout) |stdout| {
+        var reader = stdout.reader();
+        while (true) {
+            const byte = reader.readByte() catch |err| {
+                if (err != error.EndOfStream) read_err = err;
+                break;
+            };
+            if (byte == '\n') {
+                const line = std.mem.trimRight(u8, line_buf.items, "\r");
+                if (line.len > 0) {
+                    callback(allocator, line, ctx) catch |err| {
+                        read_err = err;
+                        break;
+                    };
+                }
+                line_buf.clearRetainingCapacity();
+            } else {
+                try line_buf.append(byte);
             }
-            line_buf.clearRetainingCapacity();
-        } else {
-            try line_buf.append(byte);
         }
     }
+
+    if (child.stderr) |stderr| {
+        stderr.reader().readAllArrayList(&stderr_buf, 65536) catch {};
+    }
+
+    const term = child.wait() catch |err| {
+        std.log.err("curl wait failed: {}", .{err});
+        return err;
+    };
+
+    switch (term) {
+        .Exited => |code| {
+            if (code != 0) {
+                std.log.err("curl exit code {d}: {s}", .{ code, stderr_buf.items });
+                return error.CurlFailed;
+            }
+        },
+        else => {
+            std.log.err("curl terminated abnormally: {}", .{term});
+            return error.CurlFailed;
+        },
+    }
+
+    if (read_err) |err| return err;
 }
 
 const ChatStreamContext = struct {
@@ -3368,10 +3408,15 @@ fn handleRequest(allocator: std.mem.Allocator, conn: std.net.Server.Connection) 
 }
 
 const ChatRequestData = struct {
-    session_id: ?[]const u8,
-    message: []const u8,
+    session_id: ?[]u8,
+    message: []u8,
     images: ?std.json.Array,
     agent_mode: bool,
+
+    fn deinit(self: *ChatRequestData, allocator: std.mem.Allocator) void {
+        if (self.session_id) |s| allocator.free(s);
+        allocator.free(self.message);
+    }
 };
 
 fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ChatRequestData {
@@ -3382,16 +3427,21 @@ fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ChatRequest
     const obj = parsed.value.object;
 
     const message_val = obj.get("message") orelse return error.MissingMessage;
-    const message = if (message_val == .string) message_val.string else return error.MissingMessage;
+    const message_src = if (message_val == .string) message_val.string else return error.MissingMessage;
 
-    const trimmed = std.mem.trim(u8, message, " \t\n\r");
+    const trimmed = std.mem.trim(u8, message_src, " \t\n\r");
     if (trimmed.len == 0) return error.EmptyMessage;
-    if (message.len > MAX_MESSAGE_LENGTH) return error.MessageTooLong;
+    if (message_src.len > MAX_MESSAGE_LENGTH) return error.MessageTooLong;
 
-    const session_id = if (obj.get("session_id")) |sv|
-        if (sv == .string and sv.string.len > 0) sv.string else null
-    else
-        null;
+    const message = try allocator.dupe(u8, message_src);
+    errdefer allocator.free(message);
+
+    const session_id: ?[]u8 = if (obj.get("session_id")) |sv| blk: {
+        if (sv == .string and sv.string.len > 0) {
+            break :blk try allocator.dupe(u8, sv.string);
+        }
+        break :blk null;
+    } else null;
 
     const agent_mode = if (obj.get("agentMode")) |am|
         if (am == .bool) am.bool else false
@@ -3418,6 +3468,21 @@ fn getOrCreateSession(allocator: std.mem.Allocator, session_id: ?[]const u8) !st
         sid = try generateUuid(allocator);
     }
 
+    {
+        sessions_mutex.lock();
+        defer sessions_mutex.unlock();
+        if (sessions_map.getPtr(sid)) |sess| {
+            sess.updated_at = nowSeconds();
+            var history = std.ArrayList(Message).init(allocator);
+            for (sess.messages.items) |msg| {
+                try history.append(try msg.clone(allocator));
+            }
+            return .{ .sid = sid, .history = history };
+        }
+    }
+
+    evictSessions();
+
     sessions_mutex.lock();
     defer sessions_mutex.unlock();
 
@@ -3429,8 +3494,6 @@ fn getOrCreateSession(allocator: std.mem.Allocator, session_id: ?[]const u8) !st
         }
         return .{ .sid = sid, .history = history };
     }
-
-    evictSessions();
 
     const now = nowSeconds();
     const key = try global_allocator.dupe(u8, sid);
@@ -3451,11 +3514,12 @@ fn handleChatEndpoint(allocator: std.mem.Allocator, conn_in: std.net.Server.Conn
         return;
     }
 
-    const req_data = parseChatRequest(allocator, body) catch {
+    var req_data = parseChatRequest(allocator, body) catch {
         const resp = "{\"detail\":\"Invalid request\"}";
         try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, resp);
         return;
     };
+    defer req_data.deinit(allocator);
 
     const session_result = getOrCreateSession(allocator, req_data.session_id) catch {
         const resp = "{\"detail\":\"Session error\"}";
@@ -3932,11 +3996,12 @@ fn handleAgentEndpoint(allocator: std.mem.Allocator, conn_in: std.net.Server.Con
         return;
     }
 
-    const req_data = parseChatRequest(allocator, body) catch {
+    var req_data = parseChatRequest(allocator, body) catch {
         const resp = "{\"detail\":\"Invalid request\"}";
         try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, resp);
         return;
     };
+    defer req_data.deinit(allocator);
 
     const session_result = getOrCreateSession(allocator, req_data.session_id) catch {
         const resp = "{\"detail\":\"Session error\"}";
