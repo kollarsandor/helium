@@ -185,7 +185,78 @@ body { background:#000; }
 .hcard:hover .hcard-del { opacity:1; }
 .hcard-del:active { background:rgba(255,59,48,.15); color:rgba(255,59,48,.8); transform:scale(.85); }
 .hcard-del svg { width:13px; height:13px; fill:currentColor; }
+.hcard-pin { display:none; width:11px; height:11px; margin-right:4px; flex-shrink:0; vertical-align:-1px; opacity:.7; }
+.hcard.pinned .hcard-pin { display:inline-block; }
+.hcard.pinned .hcard-pin svg { width:11px; height:11px; fill:var(--blue-l); }
+.hcard-pre[contenteditable="true"] { outline:none; background:rgba(0,113,227,.1); border-radius:6px; padding:2px 5px; margin:-2px -5px; -webkit-user-select:text; user-select:text; }
 .h-empty { display:flex; flex-direction:column; align-items:center; gap:9px; padding:48px 16px; text-align:center; }
+/* iOS-style action sheet */
+#action-sheet {
+  position:fixed; inset:0; z-index:9999;
+  display:flex; flex-direction:column; justify-content:flex-end;
+  pointer-events:none; opacity:0;
+  transition:opacity .25s ease;
+}
+#action-sheet[aria-hidden="false"] { pointer-events:auto; opacity:1; }
+.as-backdrop {
+  position:absolute; inset:0;
+  background:rgba(0,0,0,0.45);
+  -webkit-backdrop-filter:blur(2px); backdrop-filter:blur(2px);
+}
+.as-container {
+  position:relative; padding:0 8px calc(8px + var(--sab)) 8px;
+  transform:translateY(100%);
+  transition:transform .32s cubic-bezier(.32,.72,0,1);
+  display:flex; flex-direction:column; gap:8px;
+  pointer-events:auto;
+}
+#action-sheet[aria-hidden="false"] .as-container { transform:translateY(0); }
+.as-group {
+  background:rgba(28,28,30,0.92);
+  -webkit-backdrop-filter:blur(40px) saturate(180%);
+  backdrop-filter:blur(40px) saturate(180%);
+  border-radius:14px; overflow:hidden;
+  display:flex; flex-direction:column;
+}
+.as-title-block {
+  padding:14px 16px 12px;
+  text-align:center;
+  border-bottom:.5px solid rgba(255,255,255,0.08);
+}
+.as-title { font-size:13px; color:rgba(235,235,245,0.6); font-weight:400; line-height:1.35; word-break:break-word; }
+.as-option {
+  -webkit-appearance:none; appearance:none; background:transparent; border:none;
+  color:#0a84ff; font-family:inherit; font-size:20px; font-weight:400;
+  padding:17px 16px; text-align:center; cursor:pointer;
+  border-bottom:.5px solid rgba(255,255,255,0.08);
+  display:flex; align-items:center; justify-content:center; gap:8px;
+  transition:background .08s;
+  -webkit-tap-highlight-color:transparent;
+}
+.as-option:last-child { border-bottom:none; }
+.as-option:active { background:rgba(255,255,255,0.08); }
+.as-option.destructive { color:#ff453a; }
+.as-option.destructive.confirm { font-weight:600; }
+.as-option svg { width:18px; height:18px; fill:currentColor; opacity:.95; }
+.as-cancel {
+  -webkit-appearance:none; appearance:none; background:rgba(44,44,46,0.96);
+  -webkit-backdrop-filter:blur(40px) saturate(180%);
+  backdrop-filter:blur(40px) saturate(180%);
+  border:none; border-radius:14px;
+  color:#0a84ff; font-family:inherit; font-size:20px; font-weight:600;
+  padding:17px 16px; cursor:pointer;
+  -webkit-tap-highlight-color:transparent;
+  transition:background .08s;
+}
+.as-cancel:active { background:rgba(255,255,255,0.08); }
+@media (prefers-color-scheme:light) {
+  .as-group { background:rgba(242,242,242,0.94); }
+  .as-cancel { background:rgba(255,255,255,0.96); }
+  .as-option { border-bottom-color:rgba(0,0,0,0.08); }
+  .as-title-block { border-bottom-color:rgba(0,0,0,0.08); }
+  .as-title { color:rgba(60,60,67,0.6); }
+}
+.hcard.long-pressing { background:var(--input-bg); border-color:var(--border-s); transform:scale(.98); }
 .h-empty svg { width:28px; height:28px; fill:var(--fg3); opacity:.45; }
 .h-empty p { font-size:13px; color:var(--fg3); line-height:1.5; }
 #content { flex:1; overflow:hidden; position:relative; z-index:1; touch-action:pan-y; }
@@ -570,6 +641,18 @@ body { background:#000; }
         </div>
       </div>
       <div id="search-status" aria-live="polite" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap"></div>
+    </div>
+  </div>
+  <div id="action-sheet" aria-hidden="true" role="dialog" aria-modal="true">
+    <div class="as-backdrop"></div>
+    <div class="as-container">
+      <div class="as-group" id="as-group">
+        <div class="as-title-block" id="as-title-block" style="display:none">
+          <div class="as-title" id="as-title"></div>
+        </div>
+        <div id="as-options"></div>
+      </div>
+      <button type="button" class="as-cancel" id="as-cancel">Mégse</button>
     </div>
   </div>
   <div id="content">
@@ -1885,6 +1968,15 @@ function newChat() {
   closeSB();
 }
 $('btn-sb-new').addEventListener('click', newChat);
+(function wireActionSheet(){
+  const root = $('action-sheet');
+  if (!root) return;
+  root.querySelector('.as-backdrop').addEventListener('click', hideActionSheet);
+  $('as-cancel').addEventListener('click', hideActionSheet);
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && root.getAttribute('aria-hidden') === 'false') hideActionSheet();
+  });
+})();
 $('btn-sidebar').addEventListener('click', () => { sbOpen ? closeSB() : openSB(); });
 $('btn-agent').addEventListener('click', () => {
   setAgentMode(!agentMode);
@@ -1895,16 +1987,109 @@ function updHist() {
   for (let i = msgs.length - 1; i >= 0; i--) { if (msgs[i].role === 'user') { fu = msgs[i]; break; } }
   const entry = { sid, preview: safeSliceText(fu?.content || 'Chat', 68) || 'Chat', count: msgs.length, ts: Date.now() };
   const ex = hmeta.findIndex(h => h.sid === sid);
-  if (ex > -1) hmeta[ex] = entry; else hmeta.unshift(entry);
+  if (ex > -1) {
+    const prev = hmeta[ex];
+    if (prev.pinned) entry.pinned = true;
+    if (prev.title) entry.title = prev.title;
+    hmeta[ex] = entry;
+  } else {
+    hmeta.unshift(entry);
+  }
   hmeta = hmeta.slice(0, 100);
   try { localStorage.setItem(HK, JSON.stringify(hmeta)); } catch (_) {}
   if (sbOpen) renderHist();
 }
+function persistHmeta() { try { localStorage.setItem(HK, JSON.stringify(hmeta)); } catch (_) {} }
+function getHistTitle(h) { return (h && typeof h.title === 'string' && h.title.trim()) ? h.title.trim() : (h?.preview || 'Chat'); }
+function sortHmeta() {
+  hmeta.sort((a, b) => {
+    const ap = a.pinned ? 1 : 0, bp = b.pinned ? 1 : 0;
+    if (ap !== bp) return bp - ap;
+    return (b.ts || 0) - (a.ts || 0);
+  });
+}
+async function deleteConversation(targetSid) {
+  try {
+    const dr = await fetch(`/api/session/${targetSid}`, { method: 'DELETE' });
+    if (!dr.ok && dr.status !== 404) { toast('Törlés sikertelen', 'err'); return false; }
+  } catch (_) { toast('Törlés sikertelen', 'err'); return false; }
+  hmeta = hmeta.filter(x => x.sid !== targetSid);
+  if (deletedGroups[targetSid]) { delete deletedGroups[targetSid]; persistDeletedGroups(); }
+  persistHmeta();
+  if (targetSid === sid) newChat();
+  renderHist();
+  return true;
+}
+function togglePinConversation(targetSid) {
+  const i = hmeta.findIndex(h => h.sid === targetSid);
+  if (i < 0) return;
+  hmeta[i].pinned = !hmeta[i].pinned;
+  sortHmeta(); persistHmeta(); renderHist();
+  toast(hmeta[i].pinned ? 'Kitűzve' : 'Kitűzés feloldva');
+}
+function startInlineRename(card, h) {
+  const pre = card.querySelector('.hcard-pre');
+  if (!pre) return;
+  pre.setAttribute('contenteditable', 'true');
+  pre.textContent = getHistTitle(h);
+  pre.focus();
+  const range = document.createRange(); range.selectNodeContents(pre);
+  const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
+  let done = false;
+  const finish = (commit) => {
+    if (done) return; done = true;
+    pre.removeAttribute('contenteditable');
+    pre.removeEventListener('blur', onBlur);
+    pre.removeEventListener('keydown', onKey);
+    if (commit) {
+      const v = (pre.textContent || '').trim().slice(0, 80);
+      const idx = hmeta.findIndex(x => x.sid === h.sid);
+      if (idx >= 0) {
+        if (v && v !== h.preview) hmeta[idx].title = v;
+        else delete hmeta[idx].title;
+        persistHmeta();
+      }
+    }
+    renderHist();
+  };
+  const onBlur = () => finish(true);
+  const onKey = (ev) => {
+    if (ev.key === 'Enter') { ev.preventDefault(); pre.blur(); }
+    else if (ev.key === 'Escape') { ev.preventDefault(); done = true; pre.removeAttribute('contenteditable'); renderHist(); }
+  };
+  pre.addEventListener('blur', onBlur);
+  pre.addEventListener('keydown', onKey);
+}
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); toast('Másolva'); }
+  catch (_) {
+    try {
+      const ta = document.createElement('textarea'); ta.value = text;
+      ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      document.execCommand('copy'); document.body.removeChild(ta);
+      toast('Másolva');
+    } catch (__) { toast('Másolás sikertelen', 'err'); }
+  }
+}
+function openConversationSheet(card, h) {
+  const title = getHistTitle(h);
+  showActionSheet({
+    title,
+    options: [
+      { label: h.pinned ? 'Kitűzés feloldása' : 'Kitűzés', icon: 'pin', onPress: () => togglePinConversation(h.sid) },
+      { label: 'Átnevezés', icon: 'pencil', onPress: () => startInlineRename(card, h) },
+      { label: 'Azonosító másolása', icon: 'copy', onPress: () => copyText(h.sid) },
+      { label: 'Törlés', icon: 'trash', destructive: true, confirm: 'Beszélgetés törlése', onPress: () => deleteConversation(h.sid) },
+    ],
+  });
+}
 function renderHist() {
   const histList = $('hlist'); if (!histList) return;
+  sortHmeta();
   const q = searchQuery.trim();
   const qNorm = normalizeForSearch(q);
-  const list = qNorm ? hmeta.filter(h => normalizeForSearch(h.preview).includes(qNorm)) : hmeta;
+  const list = qNorm ? hmeta.filter(h => normalizeForSearch(getHistTitle(h)).includes(qNorm)) : hmeta;
   const status = $('search-status');
   if (status) status.textContent = q ? (list.length ? `${list.length} találat` : 'Nincs találat') : '';
   const sbNew = $('btn-sb-new');
@@ -1919,25 +2104,27 @@ function renderHist() {
     return;
   }
   histList.innerHTML = '';
+  const PIN_SVG = `<span class="hcard-pin"><svg viewBox="0 0 24 24"><path d="M14 4l6 6-4 1-3 7-2-2-4 4-2-2 4-4-2-2 7-3 1-4z"/></svg></span>`;
   for (const h of list) {
     const c = document.createElement('div');
-    c.className = 'hcard' + (h.sid === sid ? ' active' : '');
-    const safe = escHtml(h.preview);
+    c.className = 'hcard' + (h.sid === sid ? ' active' : '') + (h.pinned ? ' pinned' : '');
+    const titleText = getHistTitle(h);
+    const safe = escHtml(titleText);
     const highlighted = q ? safe.replace(new RegExp(`(${q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')})`, 'gi'), '<mark>$1</mark>') : safe;
-    c.innerHTML = `<div class="hcard-body"><div class="hcard-pre">${highlighted}</div><div class="hcard-meta">${h.count} üzenet</div></div><button class="hcard-del" title="Törlés"><svg viewBox="0 0 24 24"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg></button>`;
-    c.querySelector('.hcard-del').addEventListener('click', async e => {
+    c.innerHTML = `<div class="hcard-body"><div class="hcard-pre">${PIN_SVG}${highlighted}</div><div class="hcard-meta">${h.count} üzenet</div></div><button class="hcard-del" title="Műveletek"><svg viewBox="0 0 24 24"><path d="M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg></button>`;
+    c.querySelector('.hcard-del').addEventListener('click', e => {
       e.stopPropagation();
-      try {
-        const dr = await fetch(`/api/session/${h.sid}`, { method: 'DELETE' });
-        if (!dr.ok && dr.status !== 404) { toast('Törlés sikertelen', 'err'); return; }
-      } catch (_) { toast('Törlés sikertelen', 'err'); return; }
-      hmeta = hmeta.filter(x => x.sid !== h.sid);
-      if (deletedGroups[h.sid]) { delete deletedGroups[h.sid]; persistDeletedGroups(); }
-      try { localStorage.setItem(HK, JSON.stringify(hmeta)); } catch (_) {}
-      if (h.sid === sid) newChat();
-      renderHist();
+      openConversationSheet(c, h);
     });
-    c.addEventListener('click', async () => {
+    c.addEventListener('contextmenu', e => {
+      e.preventDefault();
+      openConversationSheet(c, h);
+    });
+    attachLongPress(c, () => openConversationSheet(c, h));
+    c.addEventListener('click', async (e) => {
+      if (e.defaultPrevented) return;
+      const pre = c.querySelector('.hcard-pre');
+      if (pre && pre.getAttribute('contenteditable') === 'true') return;
       if (h.sid === sid) { closeSB(); return; }
       const prevSid = sid;
       newChat();
@@ -1953,6 +2140,99 @@ function renderHist() {
     });
     histList.appendChild(c);
   }
+}
+/* ----- Long-press detection ----- */
+function attachLongPress(el, fn, ms) {
+  ms = ms || 480;
+  let timer = null, sx = 0, sy = 0, fired = false, isTouch = false;
+  const cancel = () => {
+    if (timer) { clearTimeout(timer); timer = null; }
+    el.classList.remove('long-pressing');
+  };
+  const start = (e) => {
+    fired = false;
+    isTouch = (e.type === 'touchstart');
+    const t = isTouch ? e.touches[0] : e;
+    sx = t.clientX; sy = t.clientY;
+    el.classList.add('long-pressing');
+    timer = setTimeout(() => {
+      fired = true; cancel();
+      try { if (navigator.vibrate) navigator.vibrate(12); } catch(_) {}
+      fn(e);
+    }, ms);
+  };
+  const move = (e) => {
+    if (!timer) return;
+    const t = (e.type === 'touchmove') ? e.touches[0] : e;
+    if (Math.hypot(t.clientX - sx, t.clientY - sy) > 10) cancel();
+  };
+  const end = (e) => {
+    if (fired) {
+      e.preventDefault();
+      e.stopPropagation();
+      // Swallow the click that follows after a fired long-press
+      const swallow = (ev) => { ev.preventDefault(); ev.stopPropagation(); el.removeEventListener('click', swallow, true); };
+      el.addEventListener('click', swallow, true);
+      setTimeout(() => el.removeEventListener('click', swallow, true), 400);
+    }
+    cancel();
+  };
+  el.addEventListener('touchstart', start, { passive: true });
+  el.addEventListener('touchmove', move, { passive: true });
+  el.addEventListener('touchend', end);
+  el.addEventListener('touchcancel', cancel);
+  el.addEventListener('mousedown', (e) => { if (e.button === 0 && !isTouch) start(e); });
+  el.addEventListener('mousemove', move);
+  el.addEventListener('mouseup', end);
+  el.addEventListener('mouseleave', cancel);
+}
+/* ----- iOS-style action sheet ----- */
+let _asOnClose = null;
+function showActionSheet({ title, options, onClose }) {
+  const root = $('action-sheet');
+  const optsEl = $('as-options');
+  const titleBlock = $('as-title-block');
+  const titleEl = $('as-title');
+  if (!root || !optsEl) return;
+  if (title) { titleEl.textContent = title; titleBlock.style.display = ''; }
+  else { titleBlock.style.display = 'none'; titleEl.textContent = ''; }
+  optsEl.innerHTML = '';
+  const ICONS = {
+    pin: '<svg viewBox="0 0 24 24"><path d="M14 4l6 6-4 1-3 7-2-2-4 4-2-2 4-4-2-2 7-3 1-4z"/></svg>',
+    pencil: '<svg viewBox="0 0 24 24"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>',
+    copy: '<svg viewBox="0 0 24 24"><path d="M16 1H4a2 2 0 0 0-2 2v14h2V3h12V1zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H8V7h11v14z"/></svg>',
+    trash: '<svg viewBox="0 0 24 24"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>',
+  };
+  let pendingConfirm = null;
+  options.forEach((opt, i) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'as-option' + (opt.destructive ? ' destructive' : '');
+    btn.innerHTML = (opt.icon && ICONS[opt.icon] ? ICONS[opt.icon] : '') + `<span>${escHtml(opt.label)}</span>`;
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (opt.destructive && opt.confirm && pendingConfirm !== i) {
+        pendingConfirm = i;
+        btn.classList.add('confirm');
+        btn.querySelector('span').textContent = opt.confirm;
+        return;
+      }
+      hideActionSheet();
+      try { opt.onPress && opt.onPress(); } catch (err) { console.error(err); }
+    });
+    optsEl.appendChild(btn);
+  });
+  _asOnClose = onClose || null;
+  root.setAttribute('aria-hidden', 'false');
+  document.body.style.overflow = 'hidden';
+}
+function hideActionSheet() {
+  const root = $('action-sheet');
+  if (!root) return;
+  root.setAttribute('aria-hidden', 'true');
+  document.body.style.overflow = '';
+  const cb = _asOnClose; _asOnClose = null;
+  if (cb) try { cb(); } catch (_) {}
 }
 async function restoreSid(id) {
   try {

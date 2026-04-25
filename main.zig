@@ -484,7 +484,14 @@ fn normalizeInputImage(allocator: std.mem.Allocator, data: []const u8, media_typ
 }
 
 fn pathInProject(full_path: []const u8) bool {
-    return std.mem.eql(u8, full_path, project_root) or std.mem.startsWith(u8, full_path, project_root);
+    if (project_root.len == 0) return false;
+    if (std.mem.eql(u8, full_path, project_root)) return true;
+    if (!std.mem.startsWith(u8, full_path, project_root)) return false;
+    const sep = std.fs.path.sep;
+    const root_ends_with_sep = project_root[project_root.len - 1] == sep;
+    if (root_ends_with_sep) return true;
+    if (full_path.len <= project_root.len) return false;
+    return full_path[project_root.len] == sep;
 }
 
 fn pruneDeletedSessionsUnlocked(now: f64) void {
@@ -598,46 +605,85 @@ fn evictSessions() void {
         }
     }
 
-    sessions_mutex.lock();
-    defer sessions_mutex.unlock();
-
-    var it = sessions_map.iterator();
-    while (it.next()) |entry| {
-        if (now - entry.value_ptr.*.updated_at > SESSION_TTL) {
-            if (locked_sids.get(entry.key_ptr.*) == null) {
-                to_remove.append(entry.key_ptr.*) catch {};
-            }
-        }
+    var evicted_sids = std.ArrayList([]u8).init(global_allocator);
+    defer {
+        for (evicted_sids.items) |s| global_allocator.free(s);
+        evicted_sids.deinit();
     }
-    for (to_remove.items) |key| {
-        if (sessions_map.fetchRemove(key)) |kv| {
-            var sess = kv.value;
-            sess.deinit(global_allocator);
-            global_allocator.free(kv.key);
-        }
-    }
-    to_remove.clearRetainingCapacity();
 
-    if (sessions_map.count() > MAX_SESSIONS) {
-        const SessionEntry = struct { key: []const u8, updated_at: f64 };
-        var entries = std.ArrayList(SessionEntry).init(global_allocator);
-        defer entries.deinit();
-        var it2 = sessions_map.iterator();
-        while (it2.next()) |entry| {
-            if (locked_sids.get(entry.key_ptr.*) == null) {
-                entries.append(.{ .key = entry.key_ptr.*, .updated_at = entry.value_ptr.*.updated_at }) catch {};
+    {
+        sessions_mutex.lock();
+        defer sessions_mutex.unlock();
+
+        var it = sessions_map.iterator();
+        while (it.next()) |entry| {
+            if (now - entry.value_ptr.*.updated_at > SESSION_TTL) {
+                if (locked_sids.get(entry.key_ptr.*) == null) {
+                    to_remove.append(entry.key_ptr.*) catch {};
+                }
             }
         }
-        std.sort.block(SessionEntry, entries.items, {}, struct {
-            fn lessThan(_: void, a: SessionEntry, b: SessionEntry) bool {
-                return a.updated_at < b.updated_at;
-            }
-        }.lessThan);
-        const overflow = sessions_map.count() - MAX_SESSIONS;
-        for (entries.items[0..@min(overflow, entries.items.len)]) |e| {
-            if (sessions_map.fetchRemove(e.key)) |kv| {
+        for (to_remove.items) |key| {
+            if (sessions_map.fetchRemove(key)) |kv| {
                 var sess = kv.value;
                 sess.deinit(global_allocator);
+                if (global_allocator.dupe(u8, kv.key)) |d| {
+                    evicted_sids.append(d) catch global_allocator.free(d);
+                } else |_| {}
+                global_allocator.free(kv.key);
+            }
+        }
+        to_remove.clearRetainingCapacity();
+
+        if (sessions_map.count() > MAX_SESSIONS) {
+            const SessionEntry = struct { key: []const u8, updated_at: f64 };
+            var entries = std.ArrayList(SessionEntry).init(global_allocator);
+            defer entries.deinit();
+            var it2 = sessions_map.iterator();
+            while (it2.next()) |entry| {
+                if (locked_sids.get(entry.key_ptr.*) == null) {
+                    entries.append(.{ .key = entry.key_ptr.*, .updated_at = entry.value_ptr.*.updated_at }) catch {};
+                }
+            }
+            std.sort.block(SessionEntry, entries.items, {}, struct {
+                fn lessThan(_: void, a: SessionEntry, b: SessionEntry) bool {
+                    return a.updated_at < b.updated_at;
+                }
+            }.lessThan);
+            const overflow = sessions_map.count() - MAX_SESSIONS;
+            for (entries.items[0..@min(overflow, entries.items.len)]) |e| {
+                if (sessions_map.fetchRemove(e.key)) |kv| {
+                    var sess = kv.value;
+                    sess.deinit(global_allocator);
+                    if (global_allocator.dupe(u8, kv.key)) |d| {
+                        evicted_sids.append(d) catch global_allocator.free(d);
+                    } else |_| {}
+                    global_allocator.free(kv.key);
+                }
+            }
+        }
+    }
+
+    if (evicted_sids.items.len == 0) return;
+
+    {
+        session_locks_guard.lock();
+        defer session_locks_guard.unlock();
+        for (evicted_sids.items) |sid| {
+            if (session_locks_map.fetchRemove(sid)) |kv| {
+                global_allocator.destroy(kv.value);
+                global_allocator.free(kv.key);
+            }
+        }
+    }
+
+    {
+        session_exa_limiters_mutex.lock();
+        defer session_exa_limiters_mutex.unlock();
+        for (evicted_sids.items) |sid| {
+            if (session_exa_limiters_map.fetchRemove(sid)) |kv| {
+                kv.value.deinit();
+                global_allocator.destroy(kv.value);
                 global_allocator.free(kv.key);
             }
         }
@@ -648,44 +694,30 @@ fn saveSessionsToDisk() void {
     var json_buf = std.ArrayList(u8).init(global_allocator);
     defer json_buf.deinit();
 
-    sessions_mutex.lock();
-    const snap_keys = blk: {
-        var keys = std.ArrayList([]const u8).init(global_allocator);
-        var it = sessions_map.keyIterator();
-        while (it.next()) |k| {
-            keys.append(k.*) catch {};
-        }
-        break :blk keys;
-    };
-    defer snap_keys.deinit();
+    {
+        sessions_mutex.lock();
+        defer sessions_mutex.unlock();
 
-    var snap_sessions = std.ArrayList(struct { key: []const u8, sess: *Session }).init(global_allocator);
-    defer snap_sessions.deinit();
-    for (snap_keys.items) |k| {
-        if (sessions_map.getPtr(k)) |s| {
-            snap_sessions.append(.{ .key = k, .sess = s }) catch {};
-        }
-    }
-    sessions_mutex.unlock();
-
-    var writer = json_buf.writer();
-    writer.writeByte('{') catch return;
-    var first_sess = true;
-    for (snap_sessions.items) |entry| {
-        if (!first_sess) writer.writeByte(',') catch return;
-        first_sess = false;
-        writeJsonString(writer, entry.key) catch return;
-        writer.writeByte(':') catch return;
+        var writer = json_buf.writer();
         writer.writeByte('{') catch return;
-        writer.writeAll("\"messages\":") catch return;
-        serializeMessages(writer, entry.sess.messages.items) catch return;
-        writer.writeAll(",\"created_at\":") catch return;
-        std.fmt.format(writer, "{d}", .{entry.sess.created_at}) catch return;
-        writer.writeAll(",\"updated_at\":") catch return;
-        std.fmt.format(writer, "{d}", .{entry.sess.updated_at}) catch return;
+        var first_sess = true;
+        var it = sessions_map.iterator();
+        while (it.next()) |entry| {
+            if (!first_sess) writer.writeByte(',') catch return;
+            first_sess = false;
+            writeJsonString(writer, entry.key_ptr.*) catch return;
+            writer.writeByte(':') catch return;
+            writer.writeByte('{') catch return;
+            writer.writeAll("\"messages\":") catch return;
+            serializeMessages(writer, entry.value_ptr.*.messages.items) catch return;
+            writer.writeAll(",\"created_at\":") catch return;
+            std.fmt.format(writer, "{d}", .{entry.value_ptr.*.created_at}) catch return;
+            writer.writeAll(",\"updated_at\":") catch return;
+            std.fmt.format(writer, "{d}", .{entry.value_ptr.*.updated_at}) catch return;
+            writer.writeByte('}') catch return;
+        }
         writer.writeByte('}') catch return;
     }
-    writer.writeByte('}') catch return;
 
     const tmp_file = std.fmt.allocPrint(global_allocator, "{s}.tmp", .{persistence_file}) catch return;
     defer global_allocator.free(tmp_file);
@@ -1371,7 +1403,7 @@ fn httpGet(allocator: std.mem.Allocator, url: []const u8, headers: []const [2][]
     };
 }
 
-fn callExaSingle(allocator: std.mem.Allocator, query: []const u8, params: std.json.Value, limiter: *RateLimiter) !std.json.Value {
+fn callExaSingle(allocator: std.mem.Allocator, query: []const u8, params: std.json.Value, limiter: *RateLimiter) !std.json.Parsed(std.json.Value) {
     if (exa_api_key.len == 0) return error.ExaApiKeyNotConfigured;
     if (query.len == 0) return error.EmptyQuery;
 
@@ -1522,20 +1554,26 @@ fn callExaSingle(allocator: std.mem.Allocator, query: []const u8, params: std.js
         }
 
         const parsed = std.json.parseFromSlice(std.json.Value, allocator, response_body.items, .{}) catch return error.ExaInvalidResponse;
-        return parsed.value;
+        return parsed;
     }
     return error.ExaFailed;
 }
 
 const ExaMultiResult = struct {
     query: []u8,
-    results: ?std.json.Value,
+    parsed: ?std.json.Parsed(std.json.Value),
     err: ?[]u8,
     allocator: std.mem.Allocator,
+
+    fn results(self: *const ExaMultiResult) ?std.json.Value {
+        if (self.parsed) |p| return p.value;
+        return null;
+    }
 
     fn deinit(self: *ExaMultiResult) void {
         self.allocator.free(self.query);
         if (self.err) |e| self.allocator.free(e);
+        if (self.parsed) |p| p.deinit();
     }
 };
 
@@ -1543,7 +1581,7 @@ const ExaSearchTask = struct {
     query: []const u8,
     params: std.json.Value,
     limiter: *RateLimiter,
-    result: ?std.json.Value,
+    result: ?std.json.Parsed(std.json.Value),
     err_msg: ?[]u8,
     allocator: std.mem.Allocator,
     thread: ?std.Thread,
@@ -1584,8 +1622,9 @@ fn formatExaResultsForModel(allocator: std.mem.Allocator, results: []const ExaMu
     var truncated = false;
 
     outer: for (results) |entry| {
-        if (entry.err != null and entry.results == null) continue;
-        const res_val = entry.results orelse continue;
+        if (entry.err != null and entry.parsed == null) continue;
+        const parsed = entry.parsed orelse continue;
+        const res_val = parsed.value;
         if (res_val != .object) continue;
         const res_array = res_val.object.get("results") orelse continue;
         if (res_array != .array) continue;
@@ -1653,7 +1692,8 @@ fn formatExaResultsForSse(allocator: std.mem.Allocator, results: []const ExaMult
     var total: usize = 0;
 
     for (results) |entry| {
-        if (entry.results) |res_val| {
+        if (entry.parsed) |parsed_entry| {
+            const res_val = parsed_entry.value;
             if (res_val == .object) {
                 const res_array = res_val.object.get("results") orelse {
                     if (entry.err) |e| {
@@ -2273,7 +2313,7 @@ fn executeExaToolCall(allocator: std.mem.Allocator, tc_id: []const u8, args_str:
         if (callExaSingle(allocator, q, parsed_args.value, limiter)) |res| {
             try results.append(ExaMultiResult{
                 .query = try allocator.dupe(u8, q),
-                .results = res,
+                .parsed = res,
                 .err = null,
                 .allocator = allocator,
             });
@@ -2281,7 +2321,7 @@ fn executeExaToolCall(allocator: std.mem.Allocator, tc_id: []const u8, args_str:
             const err_msg = try std.fmt.allocPrint(allocator, "{}", .{err});
             try results.append(ExaMultiResult{
                 .query = try allocator.dupe(u8, q),
-                .results = null,
+                .parsed = null,
                 .err = err_msg,
                 .allocator = allocator,
             });
