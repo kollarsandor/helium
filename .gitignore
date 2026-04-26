@@ -1,0 +1,6 @@
+helium
+helium.o
+*.o
+zig-cache/
+zig-out/
+.zig-cache/
