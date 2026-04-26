@@ -732,6 +732,44 @@ fn saveSessionsToDisk() void {
     std.fs.renameAbsolute(tmp_file, persistence_file) catch {};
 }
 
+fn errorToHungarian(err: anyerror) []const u8 {
+    return switch (err) {
+        error.CurlFailed => "Hálózati hiba a felső szolgáltatóval. Próbáld újra néhány másodperc múlva.",
+        error.ExaApiKeyNotConfigured => "A keresőszolgáltatás nincs beállítva.",
+        error.EmptyQuery => "Üres keresési lekérdezés.",
+        error.ExaRateLimited => "A keresőszolgáltatás kérési korlátba ütközött. Várj egy kicsit.",
+        error.ExaServerError => "A keresőszolgáltatás hibát adott vissza. Próbáld újra.",
+        error.ExaInvalidResponse => "A keresőszolgáltatás érvénytelen választ adott.",
+        error.ExaFailed => "A keresés meghiúsult. Próbáld újra.",
+        error.ImageTooLarge => "A kép túl nagy.",
+        error.UnsupportedImageFormat => "Nem támogatott képformátum.",
+        error.ImageMediaTypeMismatch => "A kép típusa nem egyezik a tartalommal.",
+        error.InvalidBase64, error.EmptyBase64, error.EmptyBase64AfterStrip, error.InvalidBase64Encoding => "Érvénytelen kép kódolás.",
+        error.OutOfMemory => "A szerver memóriája megtelt. Próbáld újra.",
+        error.SessionDeleted => "A munkamenet törölve lett.",
+        else => "",
+    };
+}
+
+fn sendErrorEvent(allocator: std.mem.Allocator, writer: anytype, err: anyerror) !void {
+    const friendly = errorToHungarian(err);
+    var ev_buf = std.ArrayList(u8).init(allocator);
+    defer ev_buf.deinit();
+    const w = ev_buf.writer();
+    try w.writeAll("{\"type\":\"error\",\"message\":");
+    if (friendly.len > 0) {
+        try writeJsonString(w, friendly);
+    } else {
+        const fallback = try std.fmt.allocPrint(allocator, "Szerverhiba: {s}", .{@errorName(err)});
+        defer allocator.free(fallback);
+        try writeJsonString(w, fallback);
+    }
+    try w.writeAll(",\"code\":");
+    try writeJsonString(w, @errorName(err));
+    try w.writeByte('}');
+    try sendSseEvent(writer, ev_buf.items);
+}
+
 fn writeJsonString(writer: anytype, s: []const u8) !void {
     try writer.writeByte('"');
     for (s) |c| {
@@ -2036,7 +2074,7 @@ fn writeAgentTools(writer: anytype) !void {
     try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"search_files\",\"description\":\"Search for a regex pattern in project files using grep.\",\"parameters\":{\"type\":\"object\",\"required\":[\"pattern\"],\"properties\":{\"pattern\":{\"type\":\"string\",\"description\":\"Regex pattern to search for.\"},\"path\":{\"type\":\"string\",\"description\":\"Directory to search in. Default: project root.\"},\"file_glob\":{\"type\":\"string\",\"description\":\"File glob filter, e.g. '*.py' or '*.html'.\"}}}}}");
 }
 
-fn callOpenAIStreaming(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, body: []const u8, callback: anytype, ctx: anytype) !void {
+fn callOpenAIStreamingOnce(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, body: []const u8, callback: anytype, ctx: anytype, started: *bool) !void {
     const url_str = try std.fmt.allocPrint(allocator, "{s}/chat/completions", .{base_url});
     defer allocator.free(url_str);
 
@@ -2050,6 +2088,8 @@ fn callOpenAIStreaming(allocator: std.mem.Allocator, base_url: []const u8, api_k
         "--no-buffer",
         "--fail-with-body",
         "--max-time", "600",
+        "--connect-timeout", "30",
+        "--retry", "0",
         "-X", "POST",
         url_str,
         "-H", auth_header,
@@ -2086,6 +2126,7 @@ fn callOpenAIStreaming(allocator: std.mem.Allocator, base_url: []const u8, api_k
             if (byte == '\n') {
                 const line = std.mem.trimRight(u8, line_buf.items, "\r");
                 if (line.len > 0) {
+                    started.* = true;
                     callback(allocator, line, ctx) catch |err| {
                         read_err = err;
                         break;
@@ -2121,6 +2162,22 @@ fn callOpenAIStreaming(allocator: std.mem.Allocator, base_url: []const u8, api_k
     }
 
     if (read_err) |err| return err;
+}
+
+fn callOpenAIStreaming(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, body: []const u8, callback: anytype, ctx: anytype) !void {
+    const max_attempts: u32 = 3;
+    var attempt: u32 = 0;
+    while (true) : (attempt += 1) {
+        var started: bool = false;
+        if (callOpenAIStreamingOnce(allocator, base_url, api_key, body, callback, ctx, &started)) {
+            return;
+        } else |err| {
+            if (started or err != error.CurlFailed or attempt + 1 >= max_attempts) return err;
+            const backoff_ms: u64 = @as(u64, 600) << @as(u6, @intCast(attempt));
+            std.log.warn("upstream curl failed, retrying in {d}ms (attempt {d}/{d})", .{ backoff_ms, attempt + 2, max_attempts });
+            std.time.sleep(backoff_ms * std.time.ns_per_ms);
+        }
+    }
 }
 
 const ChatStreamContext = struct {
@@ -3713,9 +3770,8 @@ fn handleChatEndpoint(allocator: std.mem.Allocator, conn_in: std.net.Server.Conn
 
         const base_url = "https://api.hpc-ai.com/inference/v1";
         callOpenAIStreaming(allocator, base_url, hpc_ai_api_key, request_body, chatStreamCallback, &ctx) catch |err| {
-            const err_ev = try std.fmt.allocPrint(allocator, "{{\"type\":\"error\",\"message\":\"{}\"}}", .{err});
-            defer allocator.free(err_ev);
-            try sendSseEvent(writer, err_ev);
+            std.log.err("chat stream failed: {s}", .{@errorName(err)});
+            try sendErrorEvent(allocator, writer, err);
             rollbackSessionTurn(sid, msg_id);
             const done_ev = try std.fmt.allocPrint(allocator, "{{\"type\":\"done\",\"session_id\":\"{s}\"}}", .{sid});
             defer allocator.free(done_ev);
@@ -3822,12 +3878,26 @@ fn handleChatEndpoint(allocator: std.mem.Allocator, conn_in: std.net.Server.Conn
                 if (std.mem.eql(u8, tc.function.name, "exa_search")) {
                     has_search_tool = true;
                     const tool_result = executeExaToolCall(allocator, tc.id, tc.function.arguments, sid) catch |err| blk3: {
+                        std.log.err("exa search failed: {s}", .{@errorName(err)});
                         var evs = std.ArrayList([]u8).init(allocator);
-                        const ev = try std.fmt.allocPrint(allocator, "{{\"type\":\"search_error\",\"id\":\"{s}\",\"error\":\"{}\"}}", .{ tc.id, err });
+                        var ev_buf = std.ArrayList(u8).init(allocator);
+                        defer ev_buf.deinit();
+                        const ew = ev_buf.writer();
+                        try ew.writeAll("{\"type\":\"search_error\",\"id\":");
+                        try writeJsonString(ew, tc.id);
+                        try ew.writeAll(",\"error\":");
+                        const friendly_err = errorToHungarian(err);
+                        if (friendly_err.len > 0) {
+                            try writeJsonString(ew, friendly_err);
+                        } else {
+                            try writeJsonString(ew, @errorName(err));
+                        }
+                        try ew.writeByte('}');
+                        const ev = try allocator.dupe(u8, ev_buf.items);
                         try evs.append(ev);
                         const tool_msg = Message{
                             .role = try allocator.dupe(u8, "tool"),
-                            .content = MessageContent{ .text = try std.fmt.allocPrint(allocator, "Search failed: {}", .{err}) },
+                            .content = MessageContent{ .text = try std.fmt.allocPrint(allocator, "Search failed: {s}", .{@errorName(err)}) },
                             .tool_calls = null,
                             .tool_call_id = try allocator.dupe(u8, tc.id),
                             .msg_id = null,
@@ -4223,9 +4293,8 @@ fn handleAgentEndpoint(allocator: std.mem.Allocator, conn_in: std.net.Server.Con
 
         const base_url = "https://api.fireworks.ai/inference/v1";
         callOpenAIStreaming(allocator, base_url, fireworks_api_key, request_body, agentStreamCallback, &agent_ctx) catch |err| {
-            const err_ev = try std.fmt.allocPrint(allocator, "{{\"type\":\"error\",\"message\":\"{}\"}}", .{err});
-            defer allocator.free(err_ev);
-            try sendSseEvent(writer, err_ev);
+            std.log.err("agent stream failed: {s}", .{@errorName(err)});
+            try sendErrorEvent(allocator, writer, err);
             rollbackSessionTurn(sid, msg_id);
             const done_ev = try std.fmt.allocPrint(allocator, "{{\"type\":\"done\",\"session_id\":\"{s}\"}}", .{sid});
             defer allocator.free(done_ev);
@@ -4326,9 +4395,23 @@ fn handleAgentEndpoint(allocator: std.mem.Allocator, conn_in: std.net.Server.Con
                 try sendSseEvent(writer, tool_call_ev);
 
                 const tool_result = executeAgentTool(allocator, tool_name, tool_args) catch |err| blk3: {
+                    std.log.err("agent tool '{s}' failed: {s}", .{ tool_name, @errorName(err) });
                     const evs = std.ArrayList([]u8).init(allocator);
+                    var rbuf = std.ArrayList(u8).init(allocator);
+                    defer rbuf.deinit();
+                    const rw = rbuf.writer();
+                    try rw.writeAll("{\"error\":");
+                    const friendly_err = errorToHungarian(err);
+                    if (friendly_err.len > 0) {
+                        try writeJsonString(rw, friendly_err);
+                    } else {
+                        try writeJsonString(rw, @errorName(err));
+                    }
+                    try rw.writeAll(",\"code\":");
+                    try writeJsonString(rw, @errorName(err));
+                    try rw.writeByte('}');
                     break :blk3 AgentToolResult{
-                        .result = try std.fmt.allocPrint(allocator, "{{\"error\":\"{}\"}}", .{err}),
+                        .result = try allocator.dupe(u8, rbuf.items),
                         .events = evs,
                     };
                 };
