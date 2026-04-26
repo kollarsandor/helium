@@ -77,7 +77,9 @@
   }
 }
 *,*::before,*::after { box-sizing:border-box; margin:0; padding:0; -webkit-tap-highlight-color:transparent; }
-button,[role="button"],.icon-btn { -webkit-touch-callout:none; -webkit-user-select:none; user-select:none; }
+html,body { -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
+input,textarea,[contenteditable="true"],.bubble,.ai-bubble,.bubble *,.ai-bubble *,pre,code,.cb,.cb *,.err-bbl { -webkit-user-select:text; user-select:text; -webkit-touch-callout:default; }
+button,[role="button"],.icon-btn,a,svg { -webkit-touch-callout:none; -webkit-user-select:none; user-select:none; }
 html,body { height:100%; width:100%; overflow:hidden; font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','SF Pro Display','Helvetica Neue',sans-serif; -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility; -webkit-text-size-adjust:100%; overscroll-behavior:none; }
 html.standalone body { background:#000; }
 body { background:#000; }
@@ -443,13 +445,8 @@ body { background:#000; }
 #ib-wrap {
   position:fixed; bottom:0; left:0; right:0; z-index:200;
   padding-bottom:var(--sab);
-  background:rgba(18,18,20,.72);
-  backdrop-filter:blur(40px) saturate(160%);
-  -webkit-backdrop-filter:blur(40px) saturate(160%);
-  border-top:.5px solid rgba(255,255,255,.08);
-}
-@media (prefers-color-scheme:light) {
-  #ib-wrap { background:rgba(245,245,247,.72); border-top-color:rgba(0,0,0,.06); }
+  background:transparent;
+  border-top:none;
 }
 .ib-inner { padding:10px 12px; display:flex; flex-direction:column; gap:7px; }
 .img-strip { display:flex; gap:7px; overflow-x:auto; scrollbar-width:none; padding:0 1px 1px; }
@@ -587,28 +584,6 @@ body { background:#000; }
 @media (pointer: coarse) {
   .hcard-del { opacity:1; }
 }
-.msg-group {
-  position:relative;
-  transition:transform .25s cubic-bezier(0.32,0.72,0,1.18);
-}
-.msg-group.swiping { transition:none; }
-.delete-action {
-  position:absolute;
-  right:0;
-  top:50%;
-  transform:translateY(-50%);
-  background:#ff3b30;
-  color:white;
-  padding:8px 18px;
-  border-radius:8px;
-  font-size:14px;
-  font-weight:600;
-  white-space:nowrap;
-  opacity:0;
-  pointer-events:none;
-  transition:opacity .2s;
-}
-.msg-group.swiped .delete-action { opacity:1; pointer-events:all; }
 </style>
 <script>
 (function(){
@@ -1527,7 +1502,8 @@ function addFileChip(idx) {
   const att = textAtts[idx];
   const chip = document.createElement('div');
   chip.className = 'file-chip';
-  chip.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:12px;height:12px;flex-shrink:0"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg><span class="file-chip-name">${att.name}</span><button class="img-rm" style="position:static;width:16px;height:16px;font-size:9px;flex-shrink:0">✕</button>`;
+  chip.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:12px;height:12px;flex-shrink:0"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg><span class="file-chip-name"></span><button class="img-rm" style="position:static;width:16px;height:16px;font-size:9px;flex-shrink:0">✕</button>`;
+  chip.querySelector('.file-chip-name').textContent = att.name;
   chip.querySelector('button').addEventListener('click', () => {
     const i = textAtts.indexOf(att);
     if (i > -1) textAtts.splice(i, 1);
@@ -1648,51 +1624,6 @@ function haptic(type = 'light') {
   };
   navigator.vibrate(patterns[type] || patterns.light);
 }
-function enableSwipeToDelete() {
-  const groups = document.querySelectorAll('.msg-group');
-  groups.forEach(group => {
-    let startX = 0, currentX = 0, isSwiping = false;
-    group.addEventListener('touchstart', e => {
-      if (e.touches.length !== 1) return;
-      startX = currentX = e.touches[0].clientX;
-      isSwiping = true;
-      group.classList.remove('swiped');
-    }, { passive: true });
-    group.addEventListener('touchmove', e => {
-      if (!isSwiping) return;
-      currentX = e.touches[0].clientX;
-      const diff = startX - currentX;
-      if (diff > 30) {
-        group.style.transform = `translateX(-${Math.min(diff * 0.8, 110)}px)`;
-        if (!group.querySelector('.delete-action')) {
-          const del = document.createElement('button');
-          del.className = 'delete-action';
-          del.textContent = 'Törlés';
-          del.onclick = () => {
-            haptic('error');
-            if (sid) markDeletedGroup(sid, group);
-            group.style.transition = 'all .3s cubic-bezier(.4,0,1,1)';
-            group.style.opacity = '0';
-            group.style.transform = 'translateX(-120px)';
-            setTimeout(() => { group.remove(); syncMsgsFromDom(); updHist(); }, 280);
-          };
-          group.appendChild(del);
-        }
-      }
-    }, { passive: true });
-    group.addEventListener('touchend', () => {
-      if (!isSwiping) return;
-      isSwiping = false;
-      const diff = startX - currentX;
-      if (diff > 80) {
-        group.classList.add('swiped');
-        haptic('medium');
-      } else {
-        group.style.transform = '';
-      }
-    });
-  });
-}
 function enhanceKeyboardBehavior() {
   const ib = $('ib-wrap');
   let lastHeight = 0;
@@ -1715,7 +1646,6 @@ function enhanceKeyboardBehavior() {
 }
 function initNativeEnhancements() {
   enhanceKeyboardBehavior();
-  setTimeout(enableSwipeToDelete, 800);
 }
 async function send() {
   const text = ta.value.trim();
