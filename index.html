@@ -79,7 +79,7 @@
 *,*::before,*::after { box-sizing:border-box; margin:0; padding:0; -webkit-tap-highlight-color:transparent; }
 html,body { -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
 input,textarea,[contenteditable="true"],.bubble,.ai-bubble,.bubble *,.ai-bubble *,pre,code,.cb,.cb *,.err-bbl { -webkit-user-select:text; user-select:text; -webkit-touch-callout:default; }
-button,[role="button"],.icon-btn,a,svg { -webkit-touch-callout:none; -webkit-user-select:none; user-select:none; }
+button,[role="button"],.icon-btn,a,svg { -webkit-touch-callout:none; -webkit-user-select:none; user-select:none; touch-action:manipulation; }
 html,body { height:100%; width:100%; overflow:hidden; font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','SF Pro Display','Helvetica Neue',sans-serif; -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility; -webkit-text-size-adjust:100%; overscroll-behavior:none; }
 html.standalone body { background:#000; }
 body { background:#000; }
@@ -280,7 +280,8 @@ body { background:#000; }
   touch-action:pan-y;
   scrollbar-width:none;
   padding:12px 0 84px;
-  scroll-padding: 20px 0;
+  scroll-padding-top: 20px;
+  scroll-padding-bottom: 20px;
 }
 #scroll-area::-webkit-scrollbar { display:none; }
 #scroll-area::after {
@@ -702,7 +703,9 @@ const TEXT_EXTS = new Set(['txt','md','markdown','csv','json','xml','html','css'
   'editorconfig','prettierrc','eslintrc','babelrc']);
 let sid = null, msgs = [], imgs = [], textAtts = [], streaming = false, ctrl = null,
     retries = 0, retryT = null, hmeta = [], deletedGroups = {}, sbOpen = false,
-    searchQuery = '', searchOpen = false, agentMode = false;
+    searchQuery = '', searchOpen = false, agentMode = false, _loadGen = 0, _attachmentSeq = 0;
+function nextLoadGen() { _loadGen = (_loadGen + 1) >>> 0; return _loadGen; }
+function nextAttachmentId() { _attachmentSeq = (_attachmentSeq + 1) >>> 0; return _attachmentSeq; }
 const $ = id => document.getElementById(id);
 const sa = $('scroll-area'), ml = $('msg-list'), ta = $('ta'),
       sbtn = $('sbtn'), sico = $('sico'), stb = $('stb'), istrip = $('img-strip');
@@ -713,10 +716,18 @@ function setIBH() {
   sa.style.paddingBottom = `${h + 12}px`;
   stb.style.bottom = `${h + 14}px`;
 }
+function handleViewportResize() { setIBH(); if (nearBot()) goBot(); }
 if (typeof ResizeObserver !== 'undefined') {
-  new ResizeObserver(() => { setIBH(); if (nearBot()) goBot(); }).observe($('ib-wrap'));
+  let roPending = false, roRaf = 0;
+  const ro = new ResizeObserver(() => {
+    if (roPending) return;
+    roPending = true;
+    cancelAnimationFrame(roRaf);
+    roRaf = requestAnimationFrame(() => { roPending = false; handleViewportResize(); });
+  });
+  ro.observe($('ib-wrap'));
 } else {
-  window.addEventListener('resize', () => { setIBH(); if (nearBot()) goBot(); });
+  window.addEventListener('resize', handleViewportResize);
 }
 if (window.visualViewport) {
   let vvRaf = 0;
@@ -736,26 +747,39 @@ if (window.visualViewport) {
     setTimeout(syncVV, 80);
   }, { passive: true });
 }
-sa.addEventListener('scroll', () => { 
-  stb.classList.toggle('show', !nearBot(180)); 
-  sa.classList.toggle('scrolling', true);
-  clearTimeout(window.__saScrollTimer);
-  window.__saScrollTimer = setTimeout(() => sa.classList.remove('scrolling'), 180);
-}, { passive: true });
+(function attachScrollHandler() {
+  let saScrollTimer = 0;
+  sa.addEventListener('scroll', () => {
+    stb.classList.toggle('show', !nearBot(180));
+    sa.classList.toggle('scrolling', true);
+    clearTimeout(saScrollTimer);
+    saScrollTimer = window.setTimeout(() => sa.classList.remove('scrolling'), 180);
+  }, { passive: true });
+})();
 stb.addEventListener('click', () => goBot(true));
 function nearBot(d = 140) { return sa.scrollHeight - sa.scrollTop - sa.clientHeight < d; }
 function goBot(smooth = false) { sa.scrollTo({ top: sa.scrollHeight, behavior: smooth ? 'smooth' : 'auto' }); }
-function scrollToMsg(el) { sa.scrollTo({ top: Math.max(0, el.offsetTop - 10), behavior: 'smooth' }); }
+function scrollToMsg(el) {
+  if (!el) return;
+  const elRect = el.getBoundingClientRect();
+  const saRect = sa.getBoundingClientRect();
+  const targetTop = sa.scrollTop + (elRect.top - saRect.top) - 10;
+  sa.scrollTo({ top: Math.max(0, targetTop), behavior: 'smooth' });
+}
 function openSB() {
   sbOpen = true;
   const el = $('sidebar');
+  const ct = $('content');
   if (el) { el.classList.add('open'); el.setAttribute('aria-hidden', 'false'); if ('inert' in el) el.inert = false; }
+  if (ct && 'inert' in ct) ct.inert = true;
   renderHist();
 }
 function closeSB() {
   sbOpen = false;
   const el = $('sidebar');
+  const ct = $('content');
   if (el) { el.classList.remove('open'); el.setAttribute('aria-hidden', 'true'); if ('inert' in el) el.inert = true; }
+  if (ct && 'inert' in ct) ct.inert = false;
   if (searchOpen) closeSearch();
 }
 function openSearch() {
@@ -943,9 +967,20 @@ function renderTable(raw) {
   return `<table><thead><tr>${ths}</tr></thead><tbody>${trs}</tbody></table>`;
 }
 function sanitizeHref(rawHref) {
-  const value = String(rawHref || '').trim();
+  let value = String(rawHref || '').trim();
+  value = value
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
   if (!/^(?:https?:|mailto:|tel:|\/(?!\/)|#)/i.test(value)) return '';
-  return escHtml(value);
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 function replaceMdLinks(s) {
   let out = '';
@@ -979,14 +1014,18 @@ function replaceMdLinks(s) {
   }
   return out;
 }
+const MD_TABLE_INPUT_LIMIT = 256 * 1024;
 function md(raw) {
   if (!raw) return '';
   const tables = [];
-  let s = String(raw).replace(/((?:^[^\n|]*\|[^\n]+\|?[ \t]*(?:\n|$)){3,})/gm, match => {
-    const lines = match.trim().split('\n');
-    if (lines.length < 3 || !/^\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?$/.test(lines[1].trim())) return match;
-    const i = tables.length; tables.push(match); return `\n|TABLE_${i}|\n\n`;
-  });
+  let s = String(raw);
+  if (s.length <= MD_TABLE_INPUT_LIMIT) {
+    s = s.replace(/((?:^[^\n|]{0,2000}\|[^\n]{1,4000}\|?[ \t]*(?:\n|$)){3,})/gm, match => {
+      const lines = match.trim().split('\n');
+      if (lines.length < 3 || !/^\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?$/.test(lines[1].trim())) return match;
+      const i = tables.length; tables.push(match); return `\n|TABLE_${i}|\n\n`;
+    });
+  }
   const cbs = [];
   s = s.replace(/```([^\n`]*)\n?([\s\S]*?)(?:```(?=\n|$)|$)/g, (_, lang, code) => { const i = cbs.length; cbs.push({ lang: (lang || '').trim(), code: String(code || '').trim() }); return `\x1fCB${i}CB\x1f`; });
   s = escHtml(s);
@@ -1061,7 +1100,7 @@ window.cpcode = btn => {
   const text = txt.textContent || '';
   _doCopy(text, btn, 'Másol');
 };
-function ftime() { return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }
+function ftime() { return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false }); }
 function cptext(text, btn) {
   const orig = btn.textContent;
   _doCopy(text, btn, orig);
@@ -1168,7 +1207,7 @@ async function populateComposerFromPayload(payload) {
   }
   if (payload && Array.isArray(payload.textAtts) && payload.textAtts.length) {
     for (const att of payload.textAtts) {
-      textAtts.push({ name: att.name, content: att.content, ext: att.ext });
+      textAtts.push({ id: nextAttachmentId(), name: att.name, content: att.content, ext: att.ext });
       addFileChip(textAtts.length - 1);
     }
   }
@@ -1217,7 +1256,22 @@ function syncMsgsFromDom() {
   }
   msgs = nextMsgs;
 }
+const MAX_DELETED_PER_SESSION = 500;
+const MAX_DELETED_TRIM_TARGET = 50;
 function persistDeletedGroups() {
+  for (const k of Object.keys(deletedGroups)) {
+    const list = deletedGroups[k];
+    if (Array.isArray(list) && list.length > MAX_DELETED_PER_SESSION) {
+      deletedGroups[k] = list.slice(-MAX_DELETED_PER_SESSION);
+    }
+  }
+  try { localStorage.setItem(DK, JSON.stringify(deletedGroups)); return; } catch (_) {}
+  for (const k of Object.keys(deletedGroups)) {
+    const list = deletedGroups[k];
+    if (Array.isArray(list) && list.length > MAX_DELETED_TRIM_TARGET) {
+      deletedGroups[k] = list.slice(-MAX_DELETED_TRIM_TARGET);
+    }
+  }
   try { localStorage.setItem(DK, JSON.stringify(deletedGroups)); } catch (_) {}
 }
 function getGroupCoreText(group) {
@@ -1231,41 +1285,55 @@ function getGroupCoreText(group) {
   return normalizeWhitespace(getGroupCopyText(group) || group.textContent || '');
 }
 function getGroupDeleteKey(group) {
+  if (!group) return '';
   const side = group.classList.contains('u') ? 'u' : 'a';
   const imageCount = group.querySelectorAll('.img-in-msg').length;
   return `${side}|${getGroupCoreText(group)}|${imageCount}`;
 }
-function getGroupDeleteOccurrence(group) {
-  const key = getGroupDeleteKey(group);
-  let occ = 0;
-  for (const item of Array.from(ml.querySelectorAll('.msg-group'))) {
-    if (getGroupDeleteKey(item) === key) occ++;
-    if (item === group) return occ;
-  }
-  return occ;
-}
-function isDeletedGroup(sessionId, key, occ) {
-  const list = deletedGroups[sessionId] || [];
-  return list.some(item => item.key === key && item.occ === occ);
+function getGroupDomIndex(group) {
+  if (!group || !ml) return -1;
+  const groups = Array.from(ml.querySelectorAll('.msg-group'));
+  return groups.indexOf(group);
 }
 function markDeletedGroup(sessionId, group) {
   if (!sessionId || !group) return;
+  const idx = getGroupDomIndex(group);
+  if (idx < 0) return;
   const key = getGroupDeleteKey(group);
-  const occ = getGroupDeleteOccurrence(group);
-  const list = deletedGroups[sessionId] || [];
-  if (!list.some(item => item.key === key && item.occ === occ)) {
-    list.push({ key, occ });
-    deletedGroups[sessionId] = list;
-    persistDeletedGroups();
-  }
+  const list = (deletedGroups[sessionId] || []).filter(item => item && typeof item.idx === 'number' && item.idx !== idx);
+  list.push({ idx, key });
+  list.sort((a, b) => (a.idx || 0) - (b.idx || 0));
+  deletedGroups[sessionId] = list.length > MAX_DELETED_PER_SESSION ? list.slice(-MAX_DELETED_PER_SESSION) : list;
+  persistDeletedGroups();
 }
 function applyDeletedGroupsForSession(sessionId) {
   if (!sessionId) return;
-  const seen = {};
-  for (const group of Array.from(ml.querySelectorAll('.msg-group'))) {
-    const key = getGroupDeleteKey(group);
-    seen[key] = (seen[key] || 0) + 1;
-    if (isDeletedGroup(sessionId, key, seen[key])) group.remove();
+  const list = deletedGroups[sessionId];
+  if (!Array.isArray(list) || !list.length) { syncMsgsFromDom(); return; }
+  const groups = Array.from(ml.querySelectorAll('.msg-group'));
+  const idxSet = new Set();
+  const keyCounts = new Map();
+  for (const item of list) {
+    if (!item) continue;
+    if (typeof item.idx === 'number') idxSet.add(item.idx);
+    else if (typeof item.key === 'string' && typeof item.occ === 'number') {
+      keyCounts.set(item.key, (keyCounts.get(item.key) || 0) + 1);
+    }
+  }
+  if (keyCounts.size) {
+    const seen = new Map();
+    for (let i = 0; i < groups.length; i++) {
+      const k = getGroupDeleteKey(groups[i]);
+      const seenCount = (seen.get(k) || 0) + 1;
+      seen.set(k, seenCount);
+      const want = keyCounts.get(k) || 0;
+      if (want >= seenCount) idxSet.add(i);
+    }
+  }
+  if (idxSet.size) {
+    for (let i = 0; i < groups.length; i++) {
+      if (idxSet.has(i)) groups[i].remove();
+    }
   }
   syncMsgsFromDom();
   if (sessionId === sid) {
@@ -1415,12 +1483,13 @@ function mkFooter(g, options = {}) {
   if (copyContent) g._copyText = copyContent;
 }
 function mkTyping() {
+  for (const ex of Array.from(document.querySelectorAll('#typ'))) ex.remove();
   const g = Object.assign(document.createElement('div'), { className: 'msg-group a', id: 'typ' });
   const b = document.createElement('div'); b.className = 'typing';
   for (let i = 0; i < 3; i++) b.appendChild(Object.assign(document.createElement('div'), { className: 'td' }));
   g.appendChild(b); return g;
 }
-function rmTyping() { const t = $('typ'); if (t) t.remove(); }
+function rmTyping() { for (const ex of Array.from(document.querySelectorAll('#typ'))) ex.remove(); }
 function rmRcn() { const b = $('rcn'); if (b) b.remove(); }
 function addRcn() {
   rmRcn();
@@ -1450,28 +1519,37 @@ function _getImgMime(dataUrl) {
 async function compress(url, max = 1024, q = 0.82) {
   if (_isAnimated(url)) return url;
   return new Promise((res, rej) => {
-    const img = new Image();
+    let img = new Image();
+    const cleanup = () => {
+      if (!img) return;
+      img.onload = null;
+      img.onerror = null;
+      try { img.src = ''; } catch (_) {}
+      if (typeof img.removeAttribute === 'function') { try { img.removeAttribute('src'); } catch (_) {} }
+      img = null;
+    };
+    const settle = (fn, value) => { try { fn(value); } finally { cleanup(); } };
     img.onload = () => {
       try {
         let { width: w, height: h } = img;
         if (w > max || h > max) { if (w > h) { h = Math.round(h * max / w); w = max; } else { w = Math.round(w * max / h); h = max; } }
         const c = document.createElement('canvas'); c.width = w; c.height = h;
         const ctx = c.getContext('2d');
-        if (!ctx) { rej(new Error('Canvas context unavailable')); return; }
+        if (!ctx) { settle(rej, new Error('Canvas context unavailable')); return; }
         ctx.drawImage(img, 0, 0, w, h);
         const mime = _getImgMime(url);
         const hasTrans = mime === 'image/png' || mime === 'image/webp';
         if (hasTrans) {
           c.toBlob(blob => {
-            if (!blob) { rej(new Error('Image encode failed')); return; }
-            blobToDataUrl(blob).then(res).catch(rej);
+            if (!blob) { settle(rej, new Error('Image encode failed')); return; }
+            blobToDataUrl(blob).then(v => settle(res, v)).catch(e => settle(rej, e));
           }, 'image/webp', q);
         } else {
-          res(c.toDataURL('image/jpeg', q));
+          settle(res, c.toDataURL('image/jpeg', q));
         }
-      } catch (e) { rej(e); }
+      } catch (e) { settle(rej, e); }
     };
-    img.onerror = () => rej(new Error('Image decode failed'));
+    img.onerror = () => settle(rej, new Error('Image decode failed'));
     img.src = url;
   });
 }
@@ -1489,8 +1567,36 @@ function addThumb(url) {
   });
   wrap.appendChild(im); wrap.appendChild(rm); istrip.appendChild(wrap);
 }
+function detectTextEncoding(buffer) {
+  const view = new Uint8Array(buffer);
+  if (view.length >= 3 && view[0] === 0xEF && view[1] === 0xBB && view[2] === 0xBF) return 'utf-8';
+  if (view.length >= 2 && view[0] === 0xFF && view[1] === 0xFE) return 'utf-16le';
+  if (view.length >= 2 && view[0] === 0xFE && view[1] === 0xFF) return 'utf-16be';
+  let i = 0, valid = true;
+  while (i < view.length && valid) {
+    const b = view[i];
+    if (b < 0x80) { i += 1; }
+    else if ((b & 0xE0) === 0xC0) { if (i + 1 >= view.length || (view[i + 1] & 0xC0) !== 0x80) valid = false; else i += 2; }
+    else if ((b & 0xF0) === 0xE0) { if (i + 2 >= view.length || (view[i + 1] & 0xC0) !== 0x80 || (view[i + 2] & 0xC0) !== 0x80) valid = false; else i += 3; }
+    else if ((b & 0xF8) === 0xF0) { if (i + 3 >= view.length || (view[i + 1] & 0xC0) !== 0x80 || (view[i + 2] & 0xC0) !== 0x80 || (view[i + 3] & 0xC0) !== 0x80) valid = false; else i += 4; }
+    else { valid = false; }
+  }
+  return valid ? 'utf-8' : 'windows-1252';
+}
 function readFileAsText(f) {
-  return new Promise((res, rej) => { const r = new FileReader(); r.onload = e => res(e.target.result); r.onerror = rej; r.readAsText(f, 'UTF-8'); });
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = e => {
+      try {
+        const buffer = e.target.result;
+        const enc = detectTextEncoding(buffer);
+        const decoder = new TextDecoder(enc, { fatal: false, ignoreBOM: false });
+        res(decoder.decode(buffer));
+      } catch (err) { rej(err); }
+    };
+    r.onerror = () => rej(r.error || new Error('File read failed'));
+    r.readAsArrayBuffer(f);
+  });
 }
 const MAX_TEXT_FILE_BYTES = 1024 * 1024;
 const MAX_TOTAL_TEXT_FILE_BYTES = 2 * 1024 * 1024;
@@ -1500,17 +1606,24 @@ function totalTextAttachmentBytes() {
 function addFileChip(idx) {
   istrip.style.display = 'flex';
   const att = textAtts[idx];
+  if (!att) return;
+  if (typeof att.id !== 'number') att.id = nextAttachmentId();
+  const attId = att.id;
+  const attName = String(att.name || '');
   const chip = document.createElement('div');
   chip.className = 'file-chip';
   chip.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:12px;height:12px;flex-shrink:0"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg><span class="file-chip-name"></span><button class="img-rm" style="position:static;width:16px;height:16px;font-size:9px;flex-shrink:0">✕</button>`;
-  chip.querySelector('.file-chip-name').textContent = att.name;
-  chip.querySelector('button').addEventListener('click', () => {
-    const i = textAtts.indexOf(att);
+  chip.querySelector('.file-chip-name').textContent = attName;
+  const removeBtn = chip.querySelector('button');
+  const onRemove = () => {
+    const i = textAtts.findIndex(a => a && a.id === attId);
     if (i > -1) textAtts.splice(i, 1);
+    removeBtn.removeEventListener('click', onRemove);
     chip.remove();
     if (!imgs.length && !textAtts.length) istrip.style.display = 'none';
     grow();
-  });
+  };
+  removeBtn.addEventListener('click', onRemove);
   istrip.appendChild(chip);
 }
 async function handleFiles(files) {
@@ -1541,7 +1654,7 @@ async function handleFiles(files) {
         if (f.size > MAX_TEXT_FILE_BYTES) throw new Error('A szövegfájl túl nagy');
         if (totalTextAttachmentBytes() + f.size > MAX_TOTAL_TEXT_FILE_BYTES) throw new Error('A csatolt szövegfájlok összmérete túl nagy');
         const content = await readFileAsText(f);
-        textAtts.push({ name: f.name, content, ext });
+        textAtts.push({ id: nextAttachmentId(), name: f.name, content, ext });
         addFileChip(textAtts.length - 1);
       } catch (_) {
         toast('Fájlolvasási hiba', 'err');
@@ -1599,7 +1712,9 @@ ta.addEventListener('paste', async (e) => {
   }, { passive: true });
   ibWrap.addEventListener('touchend', () => { panActive = false; }, { passive: true });
 })();
-function grow() {
+let _growRaf = 0;
+function _growApply() {
+  _growRaf = 0;
   const current = ta.offsetHeight;
   const needsShrink = ta.scrollHeight < current - 4;
   if (needsShrink) ta.style.height = 'auto';
@@ -1607,8 +1722,17 @@ function grow() {
   if (ta.style.height !== next) ta.style.height = next;
   if (!streaming) sbtn.disabled = ta.value.trim().length === 0 && imgs.length === 0 && textAtts.length === 0;
 }
+function grow() {
+  if (_growRaf) return;
+  _growRaf = requestAnimationFrame(_growApply);
+}
 ta.addEventListener('input', grow);
-ta.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!sbtn.disabled) send(); } });
+ta.addEventListener('keydown', e => {
+  if (e.key !== 'Enter' || e.shiftKey || e.isComposing) return;
+  if (sbtn.disabled) return;
+  e.preventDefault();
+  send();
+});
 sbtn.addEventListener('click', () => { streaming ? stop() : send(); });
 function stop() { if (ctrl) { ctrl.abort(); ctrl = null; } clearTimeout(retryT); retries = 0; rmRcn(); setStream(false); }
 function haptic(type = 'light') {
@@ -1739,14 +1863,23 @@ function processSSEEvent(block, ctx) {
       ctx.rcEl.dur.textContent = `${Math.round((Date.now() - (ctx.reasoningStartedAt || ctx.t0)) / 1000)}s`;
       ctx.rcEl.step.textContent = '';
     }
+  } else if (ev.type === 'tool_call') {
+    if (ctx.rcEl) {
+      ctx.rcEl._tc = (ctx.rcEl._tc || 0) + 1;
+      ctx.rcEl.toolCount.textContent = `${ctx.rcEl._tc}`;
+    }
+  } else if (ev.type === 'tool_error') {
+    if (ctx.rcEl) {
+      ctx.rcEl.toolCount.textContent = ctx.rcEl._tc > 0 ? `${ctx.rcEl._tc}` : '';
+    }
   } else if (ev.type === 'search_start') {
     ensureAgInDom();
     rmTyping();
     const el = mkSrchBar(ev.query || '');
     if (ctx.rcEl && ctx.rcEl.tools) {
       ctx.rcEl.tools.appendChild(el.wrap);
-      ctx.rcEl._tc++;
-      ctx.rcEl.toolCount.textContent = ctx.rcEl._tc > 0 ? `${ctx.rcEl._tc}` : '';
+      ctx.rcEl._tc = (ctx.rcEl._tc || 0) + 1;
+      ctx.rcEl.toolCount.textContent = `${ctx.rcEl._tc}`;
     } else {
       ag.appendChild(el.wrap);
     }
@@ -1784,10 +1917,16 @@ function processSSEEvent(block, ctx) {
   } else if (ev.type === 'error') {
     ctx._serverError = true;
     ensureAgInDom();
-    ag.appendChild(Object.assign(document.createElement('div'), { className: 'err-bbl', textContent: ev.message || 'Szerverhiba' }));
+    appendErrBubble(ag, ev.message || 'Szerverhiba');
     try { ctx.abortController?.abort(); } catch (_) {}
     if (nearBot()) goBot();
   }
+}
+function appendErrBubble(group, message) {
+  if (!group) return;
+  const last = group.lastElementChild;
+  if (last && last.classList && last.classList.contains('err-bbl') && last.textContent === message) return;
+  group.appendChild(Object.assign(document.createElement('div'), { className: 'err-bbl', textContent: message }));
 }
 async function streamReq(text, imgPay = [], meta = {}) {
   const abortController = new AbortController();
@@ -1797,17 +1936,46 @@ async function streamReq(text, imgPay = [], meta = {}) {
   const retryPayload = { rawText: meta.rawText || text, fullText: text, imageUrls: Array.isArray(meta.imageUrls) ? [...meta.imageUrls] : [], imgPay: imgPay.map(item => ({ ...item })), textAtts: cloneTextAttachments(meta.textAtts || []), agentMode: ctx._agentMode };
   const reqBody = { message: text, session_id: sid, agentMode: ctx._agentMode };
   if (imgPay.length) reqBody.images = imgPay;
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    rmTyping();
+    if (!ctx.agAdded) { ctx.agAdded = true; ml.appendChild(ag); }
+    appendErrBubble(ag, 'Nincs internetkapcsolat.');
+    mkFooter(ag, { copyContent: '', onRetry: () => retryFromPayload(retryPayload) });
+    toast('Nincs internetkapcsolat', 'err');
+    setStream(false);
+    if (ctrl === abortController) ctrl = null;
+    return;
+  }
   const timeoutId = setTimeout(() => { try { abortController.abort(); } catch (_) {} }, 90000);
   try {
     const apiUrl = ctx._agentMode ? '/api/agent' : '/api/chat';
     let resp = await fetch(apiUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(reqBody), signal: abortController.signal });
-    if (!resp.ok) { const err = new Error(`${resp.status}`); err._httpStatus = resp.status; throw err; }
+    if (!resp.ok) {
+      let serverMsg = '';
+      try { serverMsg = (await resp.text()) || ''; } catch (_) {}
+      let parsedMsg = '';
+      if (serverMsg) {
+        try {
+          const parsed = JSON.parse(serverMsg);
+          if (parsed && typeof parsed === 'object') {
+            parsedMsg = parsed.error || parsed.message || parsed.detail || '';
+          }
+        } catch (_) {}
+      }
+      const finalMsg = (parsedMsg || serverMsg || '').trim().slice(0, 500);
+      const err = new Error(finalMsg ? `${resp.status} ${finalMsg}` : `${resp.status}`);
+      err._httpStatus = resp.status;
+      err._serverBody = serverMsg;
+      throw err;
+    }
     if (resp.status === 204 || !resp.body) {
       rmTyping();
       if (!ctx.agAdded) { ctx.agAdded = true; ml.appendChild(ag); }
       ag.appendChild(Object.assign(document.createElement('div'), { className: 'ai-bubble', textContent: 'Nincs válasz.' }));
       mkFooter(ag, { copyContent: '', onRetry: () => retryFromPayload(retryPayload) });
       setStream(false);
+      if (ctrl === abortController) ctrl = null;
+      clearTimeout(timeoutId);
       return;
     }
     rmTyping(); rmRcn(); retries = 0;
@@ -1838,13 +2006,13 @@ async function streamReq(text, imgPay = [], meta = {}) {
     rmTyping();
     if (e && e.name === 'AbortError') {
       if (!ctx.agAdded) { ctx.agAdded = true; ml.appendChild(ag); }
-      ag.appendChild(Object.assign(document.createElement('div'), { className: 'err-bbl', textContent: 'A kapcsolat időtúllépés miatt megszakadt.' }));
+      appendErrBubble(ag, 'A kapcsolat időtúllépés miatt megszakadt.');
       mkFooter(ag, { copyContent: '', onRetry: () => retryFromPayload(retryPayload) });
       toast('Időtúllépés, próbáld újra', 'err');
       setStream(false);
       return;
     }
-    const noRetry = !!(e && (e._httpStatus === 401 || e._httpStatus === 403));
+    const noRetry = !!(e && (e._httpStatus === 401 || e._httpStatus === 403 || e._httpStatus === 400 || e._httpStatus === 422));
     if (!noRetry && retries < 3) {
       retries++;
       addRcn();
@@ -1855,7 +2023,7 @@ async function streamReq(text, imgPay = [], meta = {}) {
       retryT = setTimeout(() => { rmRcn(); ml.appendChild(mkTyping()); goBot(); streamReq(text, retryImgPay, retryMeta); }, delay);
     } else {
       if (!ctx.agAdded) { ctx.agAdded = true; ml.appendChild(ag); }
-      ag.appendChild(Object.assign(document.createElement('div'), { className: 'err-bbl', textContent: `Hiba: ${e?.message || 'Kapcsolódási hiba'}` }));
+      appendErrBubble(ag, `Hiba: ${e?.message || 'Kapcsolódási hiba'}`);
       mkFooter(ag, { copyContent: '', onRetry: () => retryFromPayload(retryPayload) });
       toast('Kapcsolódás sikertelen', 'err');
       setStream(false);
@@ -1952,7 +2120,7 @@ function updHist() {
 function persistHmeta() { try { localStorage.setItem(HK, JSON.stringify(hmeta)); } catch (_) {} }
 function getHistTitle(h) { return (h && typeof h.title === 'string' && h.title.trim()) ? h.title.trim() : (h?.preview || 'Chat'); }
 function sortHmeta() {
-  hmeta.sort((a, b) => {
+  hmeta = hmeta.slice().sort((a, b) => {
     const ap = a.pinned ? 1 : 0, bp = b.pinned ? 1 : 0;
     if (ap !== bp) return bp - ap;
     return (b.ts || 0) - (a.ts || 0);
@@ -2128,7 +2296,7 @@ function attachLongPress(el, fn, ms) {
   const move = (e) => {
     if (!timer) return;
     const t = (e.type === 'touchmove') ? e.touches[0] : e;
-    if (Math.hypot(t.clientX - sx, t.clientY - sy) > 10) cancel();
+    if (Math.hypot(t.clientX - sx, t.clientY - sy) > 6) cancel();
   };
   const end = (e) => {
     if (fired) {
@@ -2151,7 +2319,9 @@ function attachLongPress(el, fn, ms) {
 }
 /* ----- iOS-style action sheet ----- */
 let _asOnClose = null;
+let _asPriorInert = null;
 function showActionSheet({ title, message, options, onClose }) {
+  if (_asOnClose) { try { _asOnClose(); } catch (_) {} _asOnClose = null; }
   const root = $('action-sheet');
   const optsEl = $('as-options');
   const titleBlock = $('as-title-block');
@@ -2190,23 +2360,46 @@ function showActionSheet({ title, message, options, onClose }) {
   });
   _asOnClose = onClose || null;
   clearAnySelection();
+  const sb = $('sidebar'), ct = $('content');
+  _asPriorInert = {
+    sb: sb && 'inert' in sb ? !!sb.inert : null,
+    ct: ct && 'inert' in ct ? !!ct.inert : null
+  };
+  if (sb && 'inert' in sb) sb.inert = true;
+  if (ct && 'inert' in ct) ct.inert = true;
   root.setAttribute('aria-hidden', 'false');
   document.body.style.overflow = 'hidden';
+  requestAnimationFrame(() => { const firstBtn = root.querySelector('.as-option, .as-cancel'); if (firstBtn) try { firstBtn.focus({ preventScroll: true }); } catch (_) {} });
 }
 function hideActionSheet() {
   const root = $('action-sheet');
   if (!root) return;
   root.setAttribute('aria-hidden', 'true');
   document.body.style.overflow = '';
+  const sb = $('sidebar'), ct = $('content');
+  if (_asPriorInert) {
+    if (sb && 'inert' in sb && _asPriorInert.sb !== null) sb.inert = _asPriorInert.sb;
+    if (ct && 'inert' in ct && _asPriorInert.ct !== null) ct.inert = _asPriorInert.ct;
+    _asPriorInert = null;
+  } else {
+    if (sb && 'inert' in sb) sb.inert = !sbOpen;
+    if (ct && 'inert' in ct) ct.inert = sbOpen;
+  }
   const cb = _asOnClose; _asOnClose = null;
   if (cb) try { cb(); } catch (_) {}
 }
 async function restoreSid(id) {
+  const myGen = nextLoadGen();
+  const targetSid = id;
   try {
     const r = await fetch(`/api/session/${id}`);
+    if (myGen !== _loadGen || sid !== targetSid) return false;
     if (!r.ok) return false;
     const data = await r.json();
+    if (myGen !== _loadGen || sid !== targetSid) return false;
     if (!Array.isArray(data.messages) || !data.messages.length) return false;
+    ml.innerHTML = '';
+    msgs = [];
     let lastAg = null;
     let pendingRetryPayload = null;
     function finalizeAssistantGroup() {
@@ -2319,6 +2512,7 @@ ${content}` : content;
       }
     }
     finalizeAssistantGroup();
+    if (myGen !== _loadGen || sid !== targetSid) return false;
     const lastUser = [...msgs].reverse().find(item => item.role === 'user' && typeof item.agentMode === 'boolean');
     setAgentMode(lastUser ? lastUser.agentMode : false);
     applyDeletedGroupsForSession(id);
@@ -2425,7 +2619,7 @@ function buildPreview(group) {
     bubble.className = 'ai-bubble';
     const mdEl = document.createElement('div');
     mdEl.className = 'md';
-    mdEl.textContent = safeSliceText(text, 280);
+    mdEl.textContent = text;
     bubble.appendChild(mdEl);
     wrap.appendChild(bubble);
   }
@@ -2538,7 +2732,7 @@ msgList.addEventListener('touchmove', e => {
   if (!longPressTimer || e.touches.length !== 1) return;
   const dx = Math.abs(e.touches[0].clientX - lpStartX);
   const dy = Math.abs(e.touches[0].clientY - lpStartY);
-  if (dx > 22 || dy > 22) {
+  if (dx > 6 || dy > 6) {
     clearTimeout(longPressTimer);
     longPressTimer = 0;
     msgList.style.webkitUserSelect = '';
